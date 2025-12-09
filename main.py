@@ -1,14 +1,14 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.responses import HTMLResponse
 from fastapi.exceptions import HTTPException
 from fastapi.params import Body, Query
+
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 from typing import Annotated, Dict, List
 from selectolax.parser import HTMLParser
-import httpx
+from contextlib import asynccontextmanager
+from playwright.async_api import async_playwright, Browser
 
-
-app = FastAPI()
 
 class SelectorCSS(BaseModel):
     query: str
@@ -19,9 +19,8 @@ class SelectorCSS(BaseModel):
     @model_validator(mode='after')
     def one_of_all_and_order(self):
         if self.all is not None and self.order is not None:
-            raise ValueError('Choose one of all or order')
+            raise ValueError('Choose one of "all" or "order"')
         return self
-
 
 
 class ScrapeBody(BaseModel):
@@ -30,9 +29,39 @@ class ScrapeBody(BaseModel):
 
 
 
+_PLAYWRIGHT = None
+_BROWSER = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _PLAYWRIGHT, _BROWSER
+    _PLAYWRIGHT = await async_playwright().start()
+    _BROWSER = await _PLAYWRIGHT.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",  # важно на машинах с малым /dev/shm
+            "--disable-gpu"
+        ]
+    )
+    yield
+
+    await _BROWSER.close()
+    await _PLAYWRIGHT.stop()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+async def get_browser() -> Browser:
+    if _BROWSER is None:
+        raise RuntimeError("Browser not initialized")
+    return _BROWSER
+
 
 @app.get('/')
-def get_start_page() -> HTMLResponse:
+async def get_start_page() -> HTMLResponse:
     with open('base.html') as page:
         base_page = page.read()
     
@@ -40,13 +69,19 @@ def get_start_page() -> HTMLResponse:
 
 
 @app.post('/scrape')
-def scrape(query: Annotated[ScrapeBody, Body()]):
+async def scrape(query: Annotated[ScrapeBody, Body()], browser: Browser = Depends(get_browser)):
+    context = await browser.new_context()
+    page = await context.new_page()
+
     try:
-        page = httpx.get(str(query.url))
-    except httpx.HTTPError:
-        return HTTPException(422, detail='Page for parse not found')
-    
-    parser = HTMLParser(page.text)
+        await page.goto(str(query.url), timeout=10000)
+        await page.wait_for_load_state("networkidle")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    page_content = await page.content()
+    parser = HTMLParser(page_content)
     data = {}
     for name, selector in query.selectors.items():
         if parser.css_matches(selector.query):
